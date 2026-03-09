@@ -41,7 +41,7 @@ public class APIDefinitionProcessorFactory {
      * @return The corresponding definition processor implementation.
      */
     public static APIDefinitionProcessor getDefinitionProcessor(API api) {
-        if (api != null && api.isAsync()) {
+        if (api != null && (api.isAsync() || "WEBHOOK".equalsIgnoreCase(api.getType()))) {
             return ASYNC_PROCESSOR;
         }
         return OAS_PROCESSOR;
@@ -57,7 +57,8 @@ public class APIDefinitionProcessorFactory {
         if ("WS".equalsIgnoreCase(apiType) ||
             "WEBSUB".equalsIgnoreCase(apiType) ||
             "SSE".equalsIgnoreCase(apiType) ||
-            "ASYNC".equalsIgnoreCase(apiType)) {
+            "ASYNC".equalsIgnoreCase(apiType) ||
+            "WEBHOOK".equalsIgnoreCase(apiType)) {
             return ASYNC_PROCESSOR;
         }
         return OAS_PROCESSOR;
