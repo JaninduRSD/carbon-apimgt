@@ -330,6 +330,11 @@
             <artifactId>org.wso2.carbon.apimgt.common.analytics</artifactId>
         </dependency>
         <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+            <version>${caffeine.version}</version>
+        </dependency>
+        <dependency>
             <groupId>org.wso2.carbon</groupId>
             <artifactId>org.wso2.carbon.logging.correlation</artifactId>
         </dependency>

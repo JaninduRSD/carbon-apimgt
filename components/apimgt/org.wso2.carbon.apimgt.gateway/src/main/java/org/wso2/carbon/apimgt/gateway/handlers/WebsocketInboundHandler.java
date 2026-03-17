@@ -53,6 +53,8 @@ import org.wso2.carbon.apimgt.gateway.handlers.security.APISecurityException;
 import org.wso2.carbon.apimgt.gateway.handlers.security.APISecurityUtils;
 import org.wso2.carbon.apimgt.gateway.handlers.streaming.websocket.WebSocketAnalyticsMetricsHandler;
 import org.wso2.carbon.apimgt.gateway.handlers.streaming.websocket.WebSocketApiConstants;
+import org.wso2.carbon.apimgt.gateway.handlers.streaming.websocket.StatelessContextManager;
+import org.wso2.carbon.apimgt.gateway.handlers.streaming.websocket.VirtualThreadExecutorFactory;
 import org.wso2.carbon.apimgt.gateway.handlers.streaming.websocket.WebSocketUtils;
 import org.wso2.carbon.apimgt.gateway.inbound.InboundMessageContext;
 import org.wso2.carbon.apimgt.gateway.inbound.InboundMessageContextDataHolder;
@@ -70,6 +72,7 @@ import org.wso2.carbon.apimgt.keymgt.model.entity.API;
 import java.net.InetSocketAddress;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -85,6 +88,8 @@ public class WebsocketInboundHandler extends ChannelInboundHandlerAdapter {
     private final String API_PROPERTIES = "API_PROPERTIES";
     private final String API_CONTEXT_URI = "API_CONTEXT_URI";
     private final String WEB_SC_API_UT = "api.ut.WS_SC";
+    private final ExecutorService frameExecutor = VirtualThreadExecutorFactory.createFrameExecutor();
+    private final StatelessContextManager statelessContextManager = StatelessContextManager.getInstance();
 
     public WebsocketInboundHandler() {
         webSocketProcessor = initializeWebSocketProcessor();
@@ -113,6 +118,7 @@ public class WebsocketInboundHandler extends ChannelInboundHandlerAdapter {
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
         String channelId = ctx.channel().id().asLongText();
+        statelessContextManager.invalidate(channelId);
         if (InboundMessageContextDataHolder.getInstance().getInboundMessageContextMap().containsKey(channelId)) {
             InboundMessageContextDataHolder.getInstance().removeInboundMessageContextForConnection(channelId);
         }
@@ -227,6 +233,7 @@ public class WebsocketInboundHandler extends ChannelInboundHandlerAdapter {
                     }
                     ctx.fireChannelRead(req);
                     publishHandshakeEvent(ctx, inboundMessageContext);
+                        statelessContextManager.putContext(channelId, inboundMessageContext);
                     InboundWebsocketProcessorUtil.publishGoogleAnalyticsData(inboundMessageContext,
                             ctx.channel().remoteAddress().toString());
                 } else {
@@ -257,6 +264,8 @@ public class WebsocketInboundHandler extends ChannelInboundHandlerAdapter {
         } else if (msg instanceof PingWebSocketFrame || msg instanceof PongWebSocketFrame) {
             //if the inbound frame is a ping/pong frame, throttling, analytics will not be published.
             ctx.fireChannelRead(msg);
+        } else if (msg instanceof TextWebSocketFrame || msg instanceof io.netty.handler.codec.http.websocketx.BinaryWebSocketFrame) {
+            handleDataFrameWithOffload(ctx, (WebSocketFrame) msg, channelId, inboundMessageContext);
         } else if (msg instanceof WebSocketFrame) {
             InboundProcessorResponseDTO responseDTO =
                     webSocketProcessor.handleRequest((WebSocketFrame) msg, inboundMessageContext);
@@ -269,9 +278,12 @@ public class WebsocketInboundHandler extends ChannelInboundHandlerAdapter {
                     Attribute<Object> attributes = ctx.channel().attr(AttributeKey.valueOf(API_PROPERTIES));
                     if (attributes != null) {
                         try {
-                            HashMap apiProperties = (HashMap) attributes.get();
-                            if (apiProperties != null && !apiProperties.containsKey(WEB_SC_API_UT)) {
-                                apiProperties.put(WEB_SC_API_UT, responseDTO.getErrorCode());
+                            Object value = attributes.get();
+                            if (value instanceof Map) {
+                                Map<String, Object> apiProperties = asObjectMap(value);
+                                if (!apiProperties.containsKey(WEB_SC_API_UT)) {
+                                    apiProperties.put(WEB_SC_API_UT, responseDTO.getErrorCode());
+                                }
                             }
                         } catch (ClassCastException e) {
                             if (log.isDebugEnabled()) {
@@ -311,6 +323,91 @@ public class WebsocketInboundHandler extends ChannelInboundHandlerAdapter {
                 publishPublishEvent(ctx);
             }
         }
+    }
+
+    private void handleDataFrameWithOffload(ChannelHandlerContext ctx, WebSocketFrame frame, String channelId,
+                                            InboundMessageContext defaultContext) {
+        frameExecutor.execute(() -> {
+            InboundMessageContext frameContext = statelessContextManager.getContext(channelId, ctx, getRemoteIP(ctx));
+            if (frameContext == null) {
+                frameContext = InboundMessageContextDataHolder.getInstance().getInboundMessageContextForConnectionId(channelId);
+            }
+            if (frameContext == null) {
+                frameContext = defaultContext;
+            }
+            frameContext.setCtx(ctx);
+            frameContext.setUserIP(getRemoteIP(ctx));
+            try {
+                InboundProcessorResponseDTO responseDTO = webSocketProcessor.handleRequest(frame, frameContext);
+                final InboundMessageContext updatedContext = frameContext;
+                final InboundProcessorResponseDTO finalResponseDTO = responseDTO;
+                ctx.executor().execute(() -> {
+                    statelessContextManager.putContext(channelId, updatedContext);
+                    if (finalResponseDTO.isError()) {
+                        ReferenceCountUtil.release(frame);
+                        if (finalResponseDTO.isCloseConnection()) {
+                            InboundMessageContextDataHolder.getInstance().getInboundMessageContextMap().remove(channelId);
+                            statelessContextManager.invalidate(channelId);
+                            Attribute<Object> attributes = ctx.channel().attr(AttributeKey.valueOf(API_PROPERTIES));
+                            if (attributes != null) {
+                                try {
+                                    Object value = attributes.get();
+                                    if (value instanceof Map) {
+                                        Map<String, Object> apiProperties = asObjectMap(value);
+                                        if (!apiProperties.containsKey(WEB_SC_API_UT)) {
+                                            apiProperties.put(WEB_SC_API_UT, finalResponseDTO.getErrorCode());
+                                        }
+                                    }
+                                } catch (ClassCastException e) {
+                                    if (log.isDebugEnabled()) {
+                                        log.debug("Unable to cast attributes to a map", e);
+                                    }
+                                }
+                            }
+                            if (log.isDebugEnabled()) {
+                                log.debug(channelId + " -- Websocket API request [outbound] : Error while handling Outbound " +
+                                        "Websocket frame. Closing connection for "
+                                        + ctx.channel().toString());
+                            }
+                            handlePublishFrameErrorEvent(ctx, finalResponseDTO);
+                            ctx.writeAndFlush(new CloseWebSocketFrame(finalResponseDTO.getErrorCode(),
+                                    finalResponseDTO.getErrorMessage() + StringUtils.SPACE + "Connection closed" + "!"));
+                            ctx.close();
+                        } else {
+                            String errorMessage = finalResponseDTO.getErrorResponseString();
+                            ctx.writeAndFlush(new TextWebSocketFrame(errorMessage));
+                            handlePublishFrameErrorEvent(ctx, finalResponseDTO);
+                        }
+                    } else {
+                        if (log.isDebugEnabled()) {
+                            log.debug(channelId + " -- Websocket API request [inbound] : Sending Inbound Websocket frame." +
+                                    ctx.channel().toString());
+                        }
+                        ctx.fireChannelRead(frame);
+                        if (APIUtil.isAnalyticsEnabled()) {
+                            WebSocketUtils.setApiPropertyToChannel(ctx, Constants.REQUEST_END_TIME_PROPERTY,
+                                    System.currentTimeMillis());
+                            if (frame instanceof TextWebSocketFrame) {
+                                WebSocketUtils.setApiPropertyToChannel(ctx, Constants.RESPONSE_SIZE,
+                                        ((TextWebSocketFrame) frame).text().length());
+                            }
+                        }
+                        publishPublishEvent(ctx);
+                    }
+                });
+            } catch (Exception e) {
+                if (log.isDebugEnabled()) {
+                    log.debug("Error while processing WebSocket frame in offloaded execution", e);
+                }
+                ctx.executor().execute(() -> {
+                    ReferenceCountUtil.release(frame);
+                    statelessContextManager.invalidate(channelId);
+                    ctx.writeAndFlush(new CloseWebSocketFrame(WebSocketApiConstants.FrameErrorConstants.INTERNAL_SERVER_ERROR,
+                            "Error while processing websocket frame"));
+                    ctx.close();
+                });
+            }
+        });
     }
 
     private void handlePublishFrameErrorEvent(ChannelHandlerContext ctx, InboundProcessorResponseDTO responseDTO) {
@@ -493,15 +590,23 @@ public class WebsocketInboundHandler extends ChannelInboundHandlerAdapter {
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) throws Exception {
         Attribute<Object> attributes = ctx.channel().attr(AttributeKey.valueOf(API_PROPERTIES));
         if (cause instanceof CorruptedWebSocketFrameException && attributes != null) {
-            HashMap apiProperties = (HashMap) attributes.get();
-            CorruptedWebSocketFrameException corruptedWebSocketFrameException = ((CorruptedWebSocketFrameException) cause);
-            apiProperties.put(WEB_SC_API_UT, corruptedWebSocketFrameException.closeStatus().code());
+            Object value = attributes.get();
+            if (value instanceof Map) {
+                Map<String, Object> apiProperties = asObjectMap(value);
+                CorruptedWebSocketFrameException corruptedWebSocketFrameException =
+                        ((CorruptedWebSocketFrameException) cause);
+                apiProperties.put(WEB_SC_API_UT, corruptedWebSocketFrameException.closeStatus().code());
+            }
         }
 
         // Improve Websocket logging by adding API URI into log
         Attribute<Object> apiContextUriAttributes = ctx.channel().attr(AttributeKey.valueOf(API_CONTEXT_URI));
-        HashMap apiContextUris = (HashMap) apiContextUriAttributes.get();
-        String apiContextUri = (String) apiContextUris.get("apiContextUri");
+        String apiContextUri = null;
+        Object apiContextUriValue = apiContextUriAttributes.get();
+        if (apiContextUriValue instanceof Map) {
+            Map<String, String> apiContextUris = asStringMap(apiContextUriValue);
+            apiContextUri = apiContextUris.get("apiContextUri");
+        }
 
         if (apiContextUri != null) {
             Throwable newCause = new Throwable(cause.getMessage() + " For the URI: " + apiContextUri);
@@ -510,5 +615,15 @@ public class WebsocketInboundHandler extends ChannelInboundHandlerAdapter {
         } else {
             super.exceptionCaught(ctx, cause);
         }
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> asObjectMap(Object value) {
+        return (Map<String, Object>) value;
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, String> asStringMap(Object value) {
+        return (Map<String, String>) value;
     }
 }

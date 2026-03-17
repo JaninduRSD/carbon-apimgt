@@ -65,34 +65,49 @@ public class WebsocketUtil {
 	 */
 	protected static void initParams() {
 
-		APIManagerConfiguration config = ServiceReferenceHolder.getInstance().getAPIManagerConfiguration();
-		String cacheEnabled = config.getFirstProperty(APIConstants.GATEWAY_TOKEN_CACHE_ENABLED);
-		if (cacheEnabled != null) {
-			gatewayTokenCacheEnabled = Boolean.parseBoolean(cacheEnabled);
+		APIManagerConfiguration config = null;
+		try {
+			if (ServiceReferenceHolder.getInstance().getApiManagerConfigurationService() != null) {
+				config = ServiceReferenceHolder.getInstance().getAPIManagerConfiguration();
+			}
+		} catch (Throwable e) {
+			log.warn("APIManagerConfiguration is not available yet. Using default WebSocket settings.", e);
 		}
-		String value = config.getFirstProperty(APIConstants.REMOVE_OAUTH_HEADERS_FROM_MESSAGE);
-		if (value != null) {
-			removeOAuthHeadersFromOutMessage = Boolean.parseBoolean(value);
+
+		if (config != null) {
+			String cacheEnabled = config.getFirstProperty(APIConstants.GATEWAY_TOKEN_CACHE_ENABLED);
+			if (cacheEnabled != null) {
+				gatewayTokenCacheEnabled = Boolean.parseBoolean(cacheEnabled);
+			}
+			String value = config.getFirstProperty(APIConstants.REMOVE_OAUTH_HEADERS_FROM_MESSAGE);
+			if (value != null) {
+				removeOAuthHeadersFromOutMessage = Boolean.parseBoolean(value);
+			}
 		}
 
 		if (authorizationHeader == null) {
+			authorizationHeader = HttpHeaders.AUTHORIZATION;
 			try {
 				authorizationHeader = APIUtil
 						.getOAuthConfigurationFromAPIMConfig(APIConstants.AUTHORIZATION_HEADER);
 				if (authorizationHeader == null) {
 					authorizationHeader = HttpHeaders.AUTHORIZATION;
 				}
-			} catch (APIManagementException e) {
+			} catch (APIManagementException | RuntimeException e) {
 				log.error("Error while reading authorization header from APIM configurations", e);
 			}
 		}
 
 		//initialize CORS Configs
-		if (APIUtil.isCORSValidationEnabledForWS()) {
-			String allowedOriginsConfigured = APIUtil.getAllowedOrigins();
-			if (!allowedOriginsConfigured.isEmpty()) {
-				WebsocketUtil.allowedOriginsConfigured = new HashSet<>(Arrays.asList(allowedOriginsConfigured.split(",")));
+		try {
+			if (APIUtil.isCORSValidationEnabledForWS()) {
+				String allowedOriginsConfigured = APIUtil.getAllowedOrigins();
+				if (!allowedOriginsConfigured.isEmpty()) {
+					WebsocketUtil.allowedOriginsConfigured = new HashSet<>(Arrays.asList(allowedOriginsConfigured.split(",")));
+				}
 			}
+		} catch (RuntimeException e) {
+			log.warn("CORS settings are not available yet for WebSocket initialization. Continuing with defaults.", e);
 		}
 	}
 
